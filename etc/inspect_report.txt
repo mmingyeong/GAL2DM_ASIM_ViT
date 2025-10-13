@@ -1,0 +1,56 @@
+================================================================================
+[FILE] /scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10248.hdf5
+ size: 8.0MB | mtime: 1721029576
+ top-level keys: ['output_tscphi']
+  - [output_tscphi] DATASET
+      shape=(1, 1, 128, 128, 128), dtype=float32, compression=None, chunks=None
+      size: logical~8.0MB, physical~8.0MB
+================================================================================
+[FILE] /scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10249.hdf5
+ size: 8.0MB | mtime: 1721030883
+ top-level keys: ['output_tscphi']
+  - [output_tscphi] DATASET
+      shape=(1, 1, 128, 128, 128), dtype=float32, compression=None, chunks=None
+      size: logical~8.0MB, physical~8.0MB
+================================================================================
+[FILE] /scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10250.hdf5
+ size: 8.0MB | mtime: 1721029972
+ top-level keys: ['output_tscphi']
+  - [output_tscphi] DATASET
+      shape=(1, 1, 128, 128, 128), dtype=float32, compression=None, chunks=None
+      size: logical~8.0MB, physical~8.0MB
+================================================================================
+[FILE] /scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10251.hdf5
+ size: 8.0MB | mtime: 1721029904
+ top-level keys: ['output_tscphi']
+  - [output_tscphi] DATASET
+      shape=(1, 1, 128, 128, 128), dtype=float32, compression=None, chunks=None
+      size: logical~8.0MB, physical~8.0MB
+================================================================================
+[FILE] /scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10252.hdf5
+ size: 8.0MB | mtime: 1721029693
+ top-level keys: ['output_tscphi']
+  - [output_tscphi] DATASET
+      shape=(1, 1, 128, 128, 128), dtype=float32, compression=None, chunks=None
+      size: logical~8.0MB, physical~8.0MB
+================================================================================
+[FILE] /scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/test/1264.hdf5
+ size: 8.0MB | mtime: 1721030132
+ top-level keys: ['output_tscphi']
+  - [output_tscphi] DATASET
+      shape=(1, 1, 128, 128, 128), dtype=float32, compression=None, chunks=None
+      size: logical~8.0MB, physical~8.0MB
+================================================================================
+[FILE] /scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/test/1265.hdf5
+ size: 8.0MB | mtime: 1721030936
+ top-level keys: ['output_tscphi']
+  - [output_tscphi] DATASET
+      shape=(1, 1, 128, 128, 128), dtype=float32, compression=None, chunks=None
+      size: logical~8.0MB, physical~8.0MB
+================================================================================
+[FILE] /scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/test/1266.hdf5
+ size: 8.0MB | mtime: 1721030708
+ top-level keys: ['output_tscphi']
+  - [output_tscphi] DATASET
+      shape=(1, 1, 128, 128, 128), dtype=float32, compression=None, chunks=None
+      size: logical~8.0MB, physical~8.0MB
