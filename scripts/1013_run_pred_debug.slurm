@@ -24,7 +24,7 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 # ================================
 PROJECT_ROOT="/home/mingyeong/2510_GAL2DM_ASIM_ViT"
 YAML_PATH="${PROJECT_ROOT}/etc/asim_paths.yaml"
-CKPT_DIR="${CKPT_DIR:-results/vit/20251014_024804}"   # <-- fixed target
+CKPT_DIR="${CKPT_DIR:-results/vit/20251014_142228/patch8}"   # <-- fixed target
 OUT_DIR_BASE="results/vit_predictions"
 
 cd "${PROJECT_ROOT}" || exit 1
@@ -63,8 +63,8 @@ mkdir -p "${PRED_OUT_DIR}"
 # ================================
 IMAGE_SIZE=128
 FRAMES=128
-PATCH_SPATIAL=16
-PATCH_DEPTH=16
+PATCH_SPATIAL=8
+PATCH_DEPTH=8
 EMB_DIM=256
 DEPTH=3           # your debug training used 3
 HEADS=8

@@ -1,0 +1,131 @@
+#!/bin/bash
+#SBATCH -J vit3d_predict_sweep
+#SBATCH -o logs/vit3d_predict_sweep.%j.out
+#SBATCH -e logs/vit3d_predict_sweep.%j.err
+#SBATCH -p gpu
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=16G
+#SBATCH -t 0-03:00:00
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mmingyeong@kasi.re.kr
+
+# ================================
+# Environment
+# ================================
+module purge
+module load cuda/12.1.1
+source ~/.bashrc
+conda activate torch
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
+
+# ================================
+# Paths
+# ================================
+PROJECT_ROOT="/home/mingyeong/2510_GAL2DM_ASIM_ViT"
+YAML_PATH="${PROJECT_ROOT}/etc/asim_paths.yaml"
+
+# CKPT_BASE는 세 서브폴더(예: patch8/, patch4/, patch2/)를 포함하는 상위 디렉토리
+# (이전 이름이 imgpatch8/imgpatch4/imgpatch2 라면 아래 TAGS_FALLBACK가 자동으로 대체 시도)
+CKPT_BASE="${CKPT_BASE:-results/vit/20251014_024804}"
+OUT_DIR_BASE="results/vit_predictions"
+
+cd "${PROJECT_ROOT}" || exit 1
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
+
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+LOG_DIR="logs/${RUN_TS}"
+mkdir -p "${LOG_DIR}" "${OUT_DIR_BASE}"
+
+# ================================
+# Inference config (match training)
+# ================================
+IMAGE_SIZE=128
+FRAMES=128
+EMB_DIM=256
+DEPTH=3
+HEADS=8
+MLP_DIM=512
+BATCH_SIZE=1
+AMP_FLAG="--amp"
+SAMPLE_FRACTION="${SAMPLE_FRACTION:-1.0}"   # 전체 예측이 기본(1.0)
+
+echo "=== [PREDICT SWEEP START] $(date) on $(hostname) ==="
+which python
+python - <<'PY'
+import torch, os
+print("Torch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("torch.version.cuda:", getattr(torch.version, "cuda", None))
+print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+PY
+nvidia-smi || echo "nvidia-smi not available"
+
+set -o pipefail
+
+# (tag, patch) pairs — image_patch_size와 frame_patch_size를 동일하게 실험
+declare -a TAGS=("patch8" "patch4" "patch2")
+declare -a IPS=(8 4 2)
+declare -a DPS=(8 4 2)
+
+# 과거 명명(imgpatch8/imgpatch4/imgpatch2)도 자동 호환
+declare -a TAGS_FALLBACK=("imgpatch8" "imgpatch4" "imgpatch2")
+
+for i in "${!TAGS[@]}"; do
+  EXP_TAG="${TAGS[$i]}"
+  PATCH_SPATIAL="${IPS[$i]}"
+  PATCH_DEPTH="${DPS[$i]}"
+
+  CKPT_DIR="${CKPT_BASE}/${EXP_TAG}"
+  if [ ! -d "${CKPT_DIR}" ]; then
+    # fallback 시도
+    CKPT_DIR="${CKPT_BASE}/${TAGS_FALLBACK[$i]}"
+  fi
+  if [ ! -d "${CKPT_DIR}" ]; then
+    echo "[WARN] Skip: checkpoint dir not found for ${EXP_TAG} (tried ${CKPT_BASE}/${EXP_TAG} and fallback)."
+    continue
+  fi
+
+  # Checkpoint 선택 우선순위: epoch50 → best → latest
+  MODEL_PATH="$(ls -t ${CKPT_DIR}/*epoch50*.pt 2>/dev/null | head -n 1)"
+  if [ -z "${MODEL_PATH}" ]; then
+    MODEL_PATH="$(ls -t ${CKPT_DIR}/*best*.pt 2>/dev/null | head -n 1)"
+  fi
+  if [ -z "${MODEL_PATH}" ]; then
+    MODEL_PATH="$(ls -t ${CKPT_DIR}/*.pt 2>/dev/null | head -n 1)"
+  fi
+  if [ -z "${MODEL_PATH}" ]; then
+    echo "[WARN] Skip: no .pt checkpoint in ${CKPT_DIR}"
+    continue
+  fi
+  echo "[INFO] Using checkpoint: ${MODEL_PATH}"
+
+  # Output dir: run_ts/tag
+  RUN_STEM="$(basename "${CKPT_BASE}")"
+  PRED_OUT_DIR="${OUT_DIR_BASE}/${RUN_STEM}/${EXP_TAG}"
+  mkdir -p "${PRED_OUT_DIR}"
+
+  echo "=== [RUN] ${EXP_TAG}: image_patch_size=${PATCH_SPATIAL}, frame_patch_size=${PATCH_DEPTH} ==="
+  srun python -u "${PROJECT_ROOT}/src/predict.py" \
+    --yaml_path "${YAML_PATH}" \
+    --output_dir "${PRED_OUT_DIR}" \
+    --model_path "${MODEL_PATH}" \
+    --device "cuda" \
+    --batch_size ${BATCH_SIZE} \
+    --image_size ${IMAGE_SIZE} \
+    --frames ${FRAMES} \
+    --image_patch_size ${PATCH_SPATIAL} \
+    --frame_patch_size ${PATCH_DEPTH} \
+    --emb_dim ${EMB_DIM} \
+    --depth ${DEPTH} \
+    --heads ${HEADS} \
+    --mlp_dim ${MLP_DIM} \
+    --sample_fraction ${SAMPLE_FRACTION} \
+    ${AMP_FLAG} \
+    2>&1 | tee -a "${LOG_DIR}/vit3d_predict_${SLURM_JOB_ID}_${EXP_TAG}.log"
+
+  EXIT_CODE=${PIPESTATUS[0]}
+  echo "--- [${EXP_TAG}] exit=${EXIT_CODE} ---"
+done
+
+echo "=== [PREDICT SWEEP END] $(date) ==="
