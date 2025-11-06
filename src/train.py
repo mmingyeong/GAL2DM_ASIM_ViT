@@ -1,7 +1,7 @@
 """
 train.py (VoxelViTUNet3D: 3D Voxel-wise Regression, A-SIM 128^3)
 Author: Mingyeong Yang (mmingyeong@kasi.re.kr)
-Created: 2025-07-30 | Last-Modified: 2025-10-21
+Created: 2025-07-30 | Last-Modified: 2025-11-03
 """
 
 from __future__ import annotations
@@ -64,6 +64,21 @@ def get_clr_scheduler(optimizer, min_lr: float, max_lr: float, cycle_length: int
     return LambdaLR(optimizer, lr_lambda=triangular_clr)
 
 
+def str2bool(v):
+    """Utility to parse boolean CLI args like --validate_keys False"""
+    return str(v).lower() in ("1", "true", "t", "yes", "y")
+
+
+def _resolve_list_for_split(split: str, common_path: str | None, train_path: str | None, val_path: str | None) -> str | None:
+    """Select include/exclude list for a split. Priority: split-specific > common > None."""
+    if split == "train":
+        return train_path or common_path
+    elif split == "val":
+        return val_path or common_path
+    else:
+        return common_path
+
+
 # ----------------------------
 # Input selection helper
 # ----------------------------
@@ -76,9 +91,6 @@ def select_inputs(x: torch.Tensor, case: str, keep_two: bool) -> torch.Tensor:
         case: "both" | "ch1" | "ch2"
         keep_two: if True, always return [B,2,...] by zero-padding the missing channel
                   if False, return [B,1,...] for single-channel cases
-
-    Returns:
-        Tensor with shape [B, C_selected, D, H, W]
     """
     assert x.ndim == 5 and x.size(1) == 2, f"Expected [B,2,D,H,W], got {tuple(x.shape)}"
     if case == "both":
@@ -109,19 +121,31 @@ def train(args):
     logger.info("🚀 Starting VoxelViTUNet3D training for 3D voxel-wise regression")
     logger.info(f"Args: {vars(args)}")
 
+    # ---- Resolve include/exclude lists per split ----
+    train_include = _resolve_list_for_split("train", args.include_list, args.train_include_list, args.val_include_list)
+    val_include   = _resolve_list_for_split("val",   args.include_list, args.train_include_list, args.val_include_list)
+    train_exclude = _resolve_list_for_split("train", args.exclude_list, args.train_exclude_list, args.val_exclude_list)
+    val_exclude   = _resolve_list_for_split("val",   args.exclude_list, args.train_exclude_list, args.val_exclude_list)
+
     # ---- Data ----
     train_loader = get_dataloader(
         yaml_path=args.yaml_path, split="train",
         batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=args.pin_memory,
         target_field=args.target_field, train_val_split=args.train_val_split,
-        sample_fraction=args.sample_fraction, dtype=torch.float32, seed=args.seed)
+        sample_fraction=args.sample_fraction, dtype=torch.float32, seed=args.seed,
+        validate_keys=args.validate_keys, strict=False,
+        include_list_path=train_include, exclude_list_path=train_exclude
+    )
     val_loader = get_dataloader(
         yaml_path=args.yaml_path, split="val",
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=args.pin_memory,
         target_field=args.target_field, train_val_split=args.train_val_split,
-        sample_fraction=1.0, dtype=torch.float32, seed=args.seed)
+        sample_fraction=1.0, dtype=torch.float32, seed=args.seed,
+        validate_keys=args.validate_keys, strict=False,
+        include_list_path=val_include, exclude_list_path=val_exclude
+    )
 
     logger.info(f"📊 Train samples (files): {len(train_loader.dataset)}")
     logger.info(f"📊 Validation samples (files): {len(val_loader.dataset)}")
@@ -136,7 +160,6 @@ def train(args):
         if s > p:
             raise ValueError(f"Stride {s}>{p} is invalid.")
 
-    # Decide in_channels based on input case and ablation option
     if args.input_case == "both":
         in_ch = 2
     else:
@@ -200,8 +223,6 @@ def train(args):
 
         for step, (x, y) in enumerate(loop):
             x, y = x.to(args.device, non_blocking=True), y.to(args.device, non_blocking=True)
-
-            # Select inputs according to case (both/ch1/ch2)
             x = select_inputs(x, args.input_case, args.keep_two_channels)
 
             optimizer.zero_grad(set_to_none=True)
@@ -227,10 +248,7 @@ def train(args):
         with torch.no_grad():
             for x_val, y_val in val_loader:
                 x_val, y_val = x_val.to(args.device, non_blocking=True), y_val.to(args.device, non_blocking=True)
-
-                # Match validation inputs to the same case
                 x_val = select_inputs(x_val, args.input_case, args.keep_two_channels)
-
                 with amp_autocast():
                     pred_val = model(x_val)
                     loss_val = F.mse_loss(pred_val, y_val)
@@ -270,16 +288,22 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--pin_memory", type=bool, default=True)
+
+    # ViT-specific geometry
     parser.add_argument("--image_size", type=int, default=128)
     parser.add_argument("--frames", type=int, default=128)
     parser.add_argument("--image_patch_size", type=int, default=16)
     parser.add_argument("--frame_patch_size", type=int, default=16)
     parser.add_argument("--image_patch_stride", type=int, default=None)
     parser.add_argument("--frame_patch_stride", type=int, default=None)
+
+    # ViT-specific capacity
     parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--mlp_dim", type=int, default=512)
+
+    # Training
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--min_lr", type=float, default=1e-4)
     parser.add_argument("--max_lr", type=float, default=1e-3)
@@ -293,11 +317,29 @@ if __name__ == "__main__":
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--amp", action="store_true")
 
-    # 🔻 New flags for input ablations
+    # Input ablations
     parser.add_argument("--input_case", type=str, choices=["both", "ch1", "ch2"], default="both",
                         help="Select which input channels are provided to the model.")
     parser.add_argument("--keep_two_channels", action="store_true",
                         help="If set, keep in_channels=2 and zero-pad the missing channel for single-channel cases.")
+
+    # Dataset validation
+    parser.add_argument("--validate_keys", type=str2bool, default=True,
+                        help="Pre-scan HDF5 to check required keys (input/output_*). Set False to skip (faster).")
+
+    # Include/Exclude lists (common + split-specific)
+    parser.add_argument("--include_list", type=str, default=None,
+                        help="(Optional) Path to a text file listing files to INCLUDE for both train/val.")
+    parser.add_argument("--exclude_list", type=str, default=None,
+                        help="(Optional) Path to a text file listing files to EXCLUDE for both train/val.")
+    parser.add_argument("--train_include_list", type=str, default=None,
+                        help="(Optional) Train-only include list path.")
+    parser.add_argument("--val_include_list", type=str, default=None,
+                        help="(Optional) Val-only include list path.")
+    parser.add_argument("--train_exclude_list", type=str, default=None,
+                        help="(Optional) Train-only exclude list path.")
+    parser.add_argument("--val_exclude_list", type=str, default=None,
+                        help="(Optional) Val-only exclude list path.")
 
     args = parser.parse_args()
 
