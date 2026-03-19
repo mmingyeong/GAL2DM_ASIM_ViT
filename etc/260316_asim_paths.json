@@ -1,0 +1,14 @@
+{
+  "asim_datasets_hdf5": {
+    "base_path": "/gpfs/adupuy/cosmicweb_asim/ASIM_TSC/samples/",
+    "backup_path": "/scratch/mingyeong/adupuy/cosmicweb_asim/",
+    "training_set": {
+      "path": "training/*.hdf5",
+      "backup_path": "/scratch/mingyeong/adupuy/cosmicweb_asim/training/"
+    },
+    "validation_set": {
+      "path": "test/*.hdf5",
+      "backup_path": "/scratch/mingyeong/adupuy/cosmicweb_asim/test/"
+    }
+  }
+}

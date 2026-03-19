@@ -3,23 +3,36 @@
 """
 Predict with VoxelViTUNet3D (3D voxel-wise regression) and save to HDF5.
 
+(A-option) Prediction uses the SAME DataLoader pipeline as training:
+- Uses src.data_loader.get_dataloader(split="test") to resolve files, apply key-filtering,
+  and apply the same normalization configuration as training.
+- Augmentation is always OFF during prediction.
+
 Supports channel-ablation inference:
   --input_case {both,ch1,ch2}
   --keep_two_channels  (keep in_channels=2 and zero-pad missing channel)
 
 Author: Mingyeong Yang (mmingyeong@kasi.re.kr)
 Created: 2025-07-30
-Last-Modified: 2025-10-23
+Last-Modified: 2025-12-18
 """
 
 from __future__ import annotations
-import sys, os, argparse, yaml, torch, h5py, numpy as np
+
+import os
+import sys
+import argparse
+from contextlib import nullcontext
+from typing import List
+
+import numpy as np
+import torch
+import h5py
+from tqdm import tqdm
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-from tqdm import tqdm
-from glob import glob
-from contextlib import nullcontext
-
+from src.data_loader import get_dataloader
 from src.model import VoxelViTUNet3D as ViT3D
 from src.logger import get_logger
 
@@ -29,52 +42,70 @@ logger = get_logger("predict_vitunet3d")
 # ----------------------------
 # Helpers
 # ----------------------------
-def _natkey(path: str):
-    import re
-    tokens = re.split(r"(\d+)", os.path.basename(path))
-    return tuple(int(t) if t.isdigit() else t for t in tokens)
+def str2bool(v):
+    return str(v).lower() in ("1", "true", "t", "yes", "y")
 
 
-def _load_yaml(yaml_path: str) -> dict:
-    if not os.path.exists(yaml_path):
-        raise FileNotFoundError(f"YAML not found: {yaml_path}")
-    with open(yaml_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def _resolve_test_files(yaml_cfg: dict) -> list[str]:
-    base = yaml_cfg["asim_datasets_hdf5"]["base_path"]
-    test_rel = yaml_cfg["asim_datasets_hdf5"]["validation_set"]["path"]  # e.g., test/*.hdf5
-    pattern = os.path.join(base, test_rel)
-    files = sorted(glob(pattern), key=_natkey)
-    if not files:
-        raise FileNotFoundError(f"No test HDF5 files matched: {pattern}")
-    return files
-
-
-def _ensure_input_shape(x: np.ndarray) -> np.ndarray:
+def select_inputs(x: torch.Tensor, case: str, keep_two: bool) -> torch.Tensor:
     """
-    Accepts and returns:
-      - (N, C, D, H, W) with C in {1,2}
-      - Also accepts (2,D,H,W) or (1,2,D,H,W) etc., normalizing to (1,C,D,H,W)
+    x: [B,2,D,H,W] (data_loader yields 2ch input by design)
+    case: "both" | "ch1" | "ch2"
+    keep_two=True  -> always return 2ch with zero-padding
+    keep_two=False -> return 1ch for ch1/ch2 cases
     """
-    arr = x
-    if arr.ndim == 4 and arr.shape[0] in (1, 2):              # (C,D,H,W)
-        arr = arr[None, ...]                                   # (1,C,D,H,W)
-    elif arr.ndim == 5 and arr.shape[1] in (1, 2):             # (N,C,D,H,W)
-        pass
-    elif arr.ndim == 6 and arr.shape[0] == 1 and arr.shape[1] in (1, 2):
-        arr = np.squeeze(arr, axis=0)                          # (C,D,H,W) or (N,C,D,H,W)
-        if arr.ndim == 4: arr = arr[None, ...]
-    else:
-        raise ValueError(f"Unsupported 'input' shape: {arr.shape}")
-    return arr
+    assert x.ndim == 5 and x.size(1) == 2, f"Expected [B,2,D,H,W], got {tuple(x.shape)}"
+
+    if case == "both":
+        return x
+
+    if case == "ch1":
+        if keep_two:
+            ch1 = x[:, 0:1]
+            z = torch.zeros_like(ch1)
+            return torch.cat([ch1, z], dim=1)
+        return x[:, 0:1]
+
+    if case == "ch2":
+        if keep_two:
+            ch2 = x[:, 1:2]
+            z = torch.zeros_like(ch2)
+            return torch.cat([z, ch2], dim=1)
+        return x[:, 1:2]
+
+    raise ValueError(f"Unknown input_case: {case}")
+
+
+def _get_effective_file_paths_from_loader(loader) -> List[str]:
+    """
+    Recover file path list aligned with loader iteration order (even if dataset is Subset).
+    """
+    ds = loader.dataset
+
+    # Subset case
+    if hasattr(ds, "dataset") and hasattr(ds, "indices"):
+        base = ds.dataset
+        indices = list(ds.indices)
+        if hasattr(base, "file_paths"):
+            base_paths = list(base.file_paths)
+            return [base_paths[i] for i in indices]
+        for attr in ("files", "paths", "file_list"):
+            if hasattr(base, attr):
+                base_paths = list(getattr(base, attr))
+                return [base_paths[i] for i in indices]
+        raise AttributeError("Subset base dataset does not expose file paths (file_paths/files/paths).")
+
+    # Plain dataset case
+    if hasattr(ds, "file_paths"):
+        return list(ds.file_paths)
+    for attr in ("files", "paths", "file_list"):
+        if hasattr(ds, attr):
+            return list(getattr(ds, attr))
+
+    raise AttributeError("Dataset does not expose file paths (file_paths/files/paths).")
 
 
 def _load_checkpoint(model_path: str, device: torch.device):
-    """
-    Safe checkpoint load with optional weights_only.
-    """
+    """Safe checkpoint load with optional weights_only."""
     try:
         state = torch.load(model_path, map_location=device, weights_only=True)  # type: ignore[arg-type]
     except TypeError:
@@ -91,76 +122,6 @@ def _load_checkpoint(model_path: str, device: torch.device):
     return state
 
 
-def _find_input_dataset(h5: h5py.File) -> str | None:
-    """
-    Return the dataset key to use for inputs, or None if not found.
-    Tries several common keys and nested paths.
-    """
-    candidate_keys = [
-        "input", "inputs", "X",
-        "data/input", "dataset/input", "features/input",
-    ]
-    # exact key in root
-    for k in candidate_keys:
-        if k in h5:
-            return k
-    # nested path (group/subkey)
-    for k in candidate_keys:
-        if "/" in k:
-            grp, dset = k.split("/", 1)
-            if grp in h5 and dset in h5[grp]:
-                return k
-    # loose match in root (case-insensitive)
-    lowered = {kk.lower(): kk for kk in h5.keys()}
-    for name in ("input", "inputs", "x"):
-        if name in lowered:
-            return lowered[name]
-    return None
-
-
-def select_inputs(x: torch.Tensor, case: str, keep_two: bool) -> torch.Tensor:
-    """
-    x: [N,C,D,H,W] with C in {1,2} (from file)
-    Returns channels according to the ablation case:
-      - both:   expect/use two channels; if C==1, error
-      - ch1/ch2: if keep_two -> return 2-ch tensor with zero-padded missing channel
-                 else -> return 1-ch tensor of the selected channel
-    """
-    assert x.ndim == 5 and x.size(1) in (1, 2), f"Expected [N,1or2,D,H,W], got {tuple(x.shape)}"
-
-    if case == "both":
-        if x.size(1) != 2:
-            raise ValueError(f"--input_case both requires 2 channels, but got {x.size(1)}")
-        return x
-
-    if case == "ch1":
-        if x.size(1) == 2:
-            if keep_two:
-                ch1 = x[:, 0:1]
-                z   = torch.zeros_like(ch1)
-                return torch.cat([ch1, z], dim=1)
-            else:
-                return x[:, 0:1]
-        else:  # C==1
-            return x if not keep_two else torch.cat([x, torch.zeros_like(x)], dim=1)
-
-    if case == "ch2":
-        if x.size(1) == 2:
-            if keep_two:
-                ch2 = x[:, 1:2]
-                z   = torch.zeros_like(ch2)
-                return torch.cat([z, ch2], dim=1)
-            else:
-                return x[:, 1:2]
-        else:  # C==1
-            if keep_two:
-                z = torch.zeros_like(x)
-                return torch.cat([z, x], dim=1)
-            else:
-                return x
-    raise ValueError(case)
-
-
 # ----------------------------
 # Inference
 # ----------------------------
@@ -170,70 +131,61 @@ def run_prediction(
     model_path: str,
     device: str = "cuda",
     batch_size: int = 1,
+    # ViT geometry (must match training)
     image_size: int = 128,
     frames: int = 128,
     image_patch_size: int = 16,
     frame_patch_size: int = 16,
     image_patch_stride: int | None = None,
     frame_patch_stride: int | None = None,
+    # ViT capacity (must match training)
     emb_dim: int = 256,
     depth: int = 3,
     heads: int = 8,
     mlp_dim: int = 512,
+    # misc
     amp: bool = False,
     sample_fraction: float = 1.0,
     sample_seed: int = 42,
     input_case: str = "both",
     keep_two_channels: bool = False,
-    on_missing_input: str = "skip",  # NEW: "skip" | "stop"
+    validate_keys: bool = True,
+    target_field: str = "rho",
+    exclude_list: str | None = None,
+    include_list: str | None = None,
+    # normalization (should match training)
+    normalize_input: bool = True,
+    normalize_target: bool = False,
+    eps: float = 1e-12,
 ):
-    """
-    Run inference on HDF5 test files with channel-ablation support.
-    """
     if not (0 < sample_fraction <= 1.0):
         raise ValueError(f"--sample_fraction must be in (0,1], got {sample_fraction}")
 
-    # case-specific subdir to avoid mixing outputs
+    # case-specific subdir
     case_suffix = f"icase-{input_case}{'-keep2' if keep_two_channels else ''}"
     output_dir = os.path.join(output_dir, case_suffix)
     os.makedirs(output_dir, exist_ok=True)
 
-    # RNG for reproducible file subsampling
-    rng = np.random.default_rng(sample_seed)
-
-    # 1) Resolve test set
-    cfg = _load_yaml(yaml_path)
-    test_files = _resolve_test_files(cfg)
-
-    if sample_fraction < 1.0:
-        n_total = len(test_files)
-        n_keep = max(1, int(np.ceil(sample_fraction * n_total)))
-        keep_idx = np.sort(rng.choice(n_total, size=n_keep, replace=False))
-        test_files = [test_files[i] for i in keep_idx]
-        logger.info(f"🧪 Test files subsampled: {n_keep}/{n_total} (fraction={sample_fraction:.3f})")
-    else:
-        logger.info(f"🧪 Test files: {len(test_files)} found from YAML (no subsampling).")
-
-    # 2) Build & load model (in_channels depends on case)
     dev = torch.device(device)
+
+    # ViT geometry
     DHW = (frames, image_size, image_size)
     patch_size_3d = (frame_patch_size, image_patch_size, image_patch_size)
 
-    if frame_patch_stride is None:
-        frame_patch_stride = frame_patch_size
-    if image_patch_stride is None:
-        image_patch_stride = image_patch_size
-    patch_stride_3d = (frame_patch_stride, image_patch_stride, image_patch_stride)
+    f_stride = frame_patch_stride if frame_patch_stride is not None else frame_patch_size
+    i_stride = image_patch_stride if image_patch_stride is not None else image_patch_size
+    patch_stride_3d = (f_stride, i_stride, i_stride)
     for s, p in zip(patch_stride_3d, patch_size_3d):
         if s > p:
             raise ValueError(f"Stride {patch_stride_3d} must be <= patch {patch_size_3d} per axis.")
 
-    # Decide in_channels same as in training
+    # in_channels
     if input_case == "both":
         in_ch = 2
     else:
         in_ch = 2 if keep_two_channels else 1
 
+    # Build model
     logger.info("📦 Building model VoxelViTUNet3D ...")
     model = ViT3D(
         image_size=DHW,
@@ -249,12 +201,14 @@ def run_prediction(
         decoder_channels=(256, 128, 64),
         dropout=0.1,
     ).to(dev)
+
     logger.info(
         f"🧱 Model: image_size={DHW}, patch_size={patch_size_3d}, stride={patch_stride_3d}, "
         f"dim={emb_dim}, depth={depth}, heads={heads}, mlp_dim={mlp_dim}, in_channels={in_ch}, "
         f"input_case={input_case}, keep_two={keep_two_channels}"
     )
 
+    # Load checkpoint
     logger.info(f"📥 Loading checkpoint: {model_path}")
     state = _load_checkpoint(model_path, dev)
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -264,142 +218,128 @@ def run_prediction(
         logger.warning(f"Unexpected keys while loading: {unexpected}")
     model.eval()
 
+    # DataLoader (A-option)
+    augmentation_cfg = {"enable": False}  # force OFF
+    normalization_cfg = {
+        "mode": "custom" if (normalize_input or normalize_target) else "none",
+        "normalize_input": bool(normalize_input),
+        "normalize_target": bool(normalize_target),
+        "eps": float(eps),
+    }
+
+    test_loader = get_dataloader(
+        yaml_path=yaml_path,
+        split="test",
+        batch_size=batch_size,
+        shuffle=False,
+        sample_fraction=sample_fraction,
+        num_workers=0,  # HDF5 안정성 우선
+        pin_memory=True,
+        target_field=target_field,
+        dtype=torch.float32,
+        seed=sample_seed,
+        train_val_split=0.8,      # test에서는 무의미하지만 API상 필요
+        validate_keys=validate_keys,
+        strict=False,
+        exclude_list_path=exclude_list,
+        include_list_path=include_list,
+        augmentation=augmentation_cfg,
+        normalization=normalization_cfg,
+        apply_augmentation_in=(),
+    )
+
+    file_paths = _get_effective_file_paths_from_loader(test_loader)
+    assert len(file_paths) == len(test_loader.dataset)
+
+    logger.info(f"🧪 Test samples: {len(test_loader.dataset)} (sample_fraction={sample_fraction})")
+    logger.info(f"🧮 Normalization config (predict): {normalization_cfg}")
+
     # AMP context
     try:
         _ = torch.amp
-        if amp:
-            if dev.type == "cuda":
-                autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16)
-            else:
-                autocast_ctx = torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
-        else:
-            autocast_ctx = nullcontext()
+        autocast_ctx = (
+            torch.amp.autocast(device_type="cuda", dtype=torch.float16) if (amp and dev.type == "cuda")
+            else torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16) if (amp and dev.type == "cpu")
+            else nullcontext()
+        )
     except Exception:
         from torch.cuda.amp import autocast as legacy_autocast
         autocast_ctx = legacy_autocast(enabled=amp)
 
-    # 3) Predict per file
+    # Predict
     saved_files: list[str] = []
-    skipped_files: list[str] = []
-
     torch.set_grad_enabled(False)
+
     with torch.no_grad():
-        for input_path in tqdm(test_files, desc="🚀 Running test predictions"):
-            filename = os.path.basename(input_path)
+        for idx, (x, _y_unused) in enumerate(tqdm(test_loader, desc="🚀 Running ViT predictions")):
+            src_path = file_paths[idx]
+            filename = os.path.basename(src_path)
             output_path = os.path.join(output_dir, filename)
 
-            # Load inputs (robust to missing/variant keys)
-            with h5py.File(input_path, "r") as f:
-                key = _find_input_dataset(f)
-                if key is None:
-                    msg = f"No input-like dataset found in {input_path}"
-                    if on_missing_input == "stop":
-                        raise KeyError(msg)
-                    logger.warning(f"⚠️ {msg} — SKIP")
-                    skipped_files.append(input_path)
-                    continue
+            # x: [B,2,D,H,W]
+            x = x.to(dev, non_blocking=True)
+            x = select_inputs(x, input_case, keep_two_channels)  # [B,in_ch,D,H,W]
 
-                try:
-                    x_np = f[key][:]  # (N,C,D,H,W) or (C,D,H,W)
-                except Exception as e:
-                    msg = f"Failed to read dataset '{key}' in {input_path}: {e}"
-                    if on_missing_input == "stop":
-                        raise RuntimeError(msg)
-                    logger.warning(f"⚠️ {msg} — SKIP")
-                    skipped_files.append(input_path)
-                    continue
+            if x.size(1) != in_ch:
+                raise RuntimeError(f"Post-selection channels {x.size(1)} != model.in_channels {in_ch} at idx={idx}")
 
-            # Normalize shape
-            try:
-                x_np = _ensure_input_shape(x_np)  # -> (N,C,D,H,W) with C in {1,2}
-            except Exception as e:
-                msg = f"Invalid input shape in {input_path}: {e}"
-                if on_missing_input == "stop":
-                    raise
-                logger.warning(f"⚠️ {msg} — SKIP")
-                skipped_files.append(input_path)
-                continue
+            # Optional sanity check for spatial
+            if tuple(x.shape[-3:]) != DHW:
+                raise ValueError(f"Input spatial {tuple(x.shape[-3:])} != expected {DHW} at idx={idx} ({src_path})")
 
-            # Shape checks
-            N, Cfile, D, H, W = x_np.shape
-            if (D, H, W) != DHW:
-                msg = f"Input spatial {(D,H,W)} does not match model {DHW} in {input_path}"
-                if on_missing_input == "stop":
-                    raise ValueError(msg)
-                logger.warning(f"⚠️ {msg} — SKIP")
-                skipped_files.append(input_path)
-                continue
+            with autocast_ctx:
+                pred = model(x)  # [B,1,D,H,W]
 
-            # To tensor & select channels
-            x_tensor = torch.from_numpy(np.ascontiguousarray(x_np)).float().to(dev)
-            try:
-                x_tensor = select_inputs(x_tensor, input_case, keep_two_channels)  # [N,in_ch,D,H,W]
-            except Exception as e:
-                msg = f"Channel selection failed for {input_path}: {e}"
-                if on_missing_input == "stop":
-                    raise
-                logger.warning(f"⚠️ {msg} — SKIP")
-                skipped_files.append(input_path)
-                continue
+            y_pred = pred.float().cpu().numpy()
+            y_pred = np.squeeze(y_pred, axis=1)  # (B,D,H,W)
 
-            if x_tensor.size(1) != in_ch:
-                msg = f"Post-selection channels {x_tensor.size(1)} != model.in_channels {in_ch} in {input_path}"
-                if on_missing_input == "stop":
-                    raise RuntimeError(msg)
-                logger.warning(f"⚠️ {msg} — SKIP")
-                skipped_files.append(input_path)
-                continue
-
-            # Batched inference
-            preds = []
-            for i in range(0, x_tensor.shape[0], batch_size):
-                x_batch = x_tensor[i: i + batch_size]
-                with autocast_ctx:
-                    y_batch = model(x_batch)  # [B,1,D,H,W]
-                preds.append(y_batch.float().cpu().numpy())
-
-            y_pred = np.concatenate(preds, axis=0)  # (N,1,D,H,W)
-            y_pred = np.squeeze(y_pred, axis=1)     # (N,D,H,W) or (D,H,W)
-
-            # Save prediction
+            # Save
             with h5py.File(output_path, "w") as f_out:
                 f_out.create_dataset("prediction", data=y_pred, compression="gzip")
-                # Meta-info
-                f_out.attrs["source_file"] = input_path
+
+                # Meta
+                f_out.attrs["source_file"] = src_path
                 f_out.attrs["model_path"] = model_path
                 f_out.attrs["model_class"] = model.__class__.__name__
                 f_out.attrs["amp"] = bool(amp)
+
+                # ViT meta
                 f_out.attrs["image_size"] = int(image_size)
                 f_out.attrs["frames"] = int(frames)
                 f_out.attrs["image_patch_size"] = int(image_patch_size)
                 f_out.attrs["frame_patch_size"] = int(frame_patch_size)
-                f_out.attrs["image_patch_stride"] = int(image_patch_stride) if image_patch_stride is not None else int(image_patch_size)
-                f_out.attrs["frame_patch_stride"] = int(frame_patch_stride) if frame_patch_stride is not None else int(frame_patch_size)
+                f_out.attrs["image_patch_stride"] = int(i_stride)
+                f_out.attrs["frame_patch_stride"] = int(f_stride)
                 f_out.attrs["emb_dim"] = int(emb_dim)
                 f_out.attrs["depth"] = int(depth)
                 f_out.attrs["heads"] = int(heads)
                 f_out.attrs["mlp_dim"] = int(mlp_dim)
+
+                # data / ablation meta
                 f_out.attrs["sample_fraction_files_only"] = float(sample_fraction)
                 f_out.attrs["sample_seed"] = int(sample_seed)
                 f_out.attrs["input_case"] = str(input_case)
                 f_out.attrs["keep_two_channels"] = bool(keep_two_channels)
 
-            logger.info(f"✅ Saved: {output_path}")
+                # normalization meta
+                f_out.attrs["normalization_mode"] = str(normalization_cfg["mode"])
+                f_out.attrs["normalize_input"] = bool(normalization_cfg["normalize_input"])
+                f_out.attrs["normalize_target"] = bool(normalization_cfg["normalize_target"])
+                f_out.attrs["eps"] = float(normalization_cfg["eps"])
+
             saved_files.append(output_path)
 
-    # Summary
-    logger.info("====== Inference Summary ======")
+    logger.info("====== ViT Inference Summary ======")
     logger.info(f"Saved files : {len(saved_files)}")
-    logger.info(f"Skipped     : {len(skipped_files)}")
-    if skipped_files:
-        logger.info("Skipped list (first 20): " + ", ".join(os.path.basename(p) for p in skipped_files[:20]))
+    if saved_files:
+        logger.info("Saved (first 5): " + ", ".join(os.path.basename(p) for p in saved_files[:5]))
 
 
 # ----------------------------
 # Main
 # ----------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run VoxelViTUNet3D inference on A-SIM test files.")
+    parser = argparse.ArgumentParser(description="Run VoxelViTUNet3D inference on A-SIM test split (DataLoader-based).")
 
     # Data / Paths
     parser.add_argument("--yaml_path", type=str, required=True, help="Path to asim_paths.yaml")
@@ -411,33 +351,47 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--amp", action="store_true", help="Enable mixed-precision inference")
 
-    # Model settings (must match training)
+    # ViT geometry/capacity (must match training)
     parser.add_argument("--image_size", type=int, default=128)
     parser.add_argument("--frames", type=int, default=128)
     parser.add_argument("--image_patch_size", type=int, default=16)
     parser.add_argument("--frame_patch_size", type=int, default=16)
-    parser.add_argument("--image_patch_stride", type=int, default=None, help="stride for H/W (<= image_patch_size)")
-    parser.add_argument("--frame_patch_stride", type=int, default=None, help="stride for D (<= frame_patch_size)")
+    parser.add_argument("--image_patch_stride", type=int, default=None)
+    parser.add_argument("--frame_patch_stride", type=int, default=None)
+
     parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--mlp_dim", type=int, default=512)
 
-    # Subsampling
+    # Subsampling (file-level)
     parser.add_argument("--sample_fraction", type=float, default=1.0,
-                        help="Fraction (0,1] of TEST FILES to run. Does NOT subsample within-file samples.")
+                        help="Fraction (0,1] of TEST FILES to run (dataset is file-based).")
     parser.add_argument("--sample_seed", type=int, default=42,
                         help="Random seed for reproducible file-level subsampling.")
 
-    # 🔻 Channel ablation flags
+    # Channel ablation flags
     parser.add_argument("--input_case", type=str, choices=["both", "ch1", "ch2"], default="both",
                         help="Select which input channels are provided to the model.")
     parser.add_argument("--keep_two_channels", action="store_true",
                         help="If set, keep in_channels=2 and zero-pad the missing channel for single-channel cases.")
 
-    # 🔻 Missing-input handling policy
-    parser.add_argument("--on_missing_input", type=str, choices=["skip", "stop"], default="skip",
-                        help="When an HDF5 file lacks the input dataset: skip it (default) or stop with error.")
+    # DataLoader validation & lists
+    parser.add_argument("--validate_keys", type=str2bool, default=True,
+                        help="Pre-scan HDF5 to check required keys (input/output_*). Set False to skip (faster).")
+    parser.add_argument("--exclude_list", type=str, default=None,
+                        help="Path to text file containing bad HDF5 file paths to exclude.")
+    parser.add_argument("--include_list", type=str, default=None,
+                        help="Path to text file containing good HDF5 file paths to include only.")
+
+    # Normalization (match training)
+    parser.add_argument("--target_field", type=str, choices=["rho", "tscphi"], default="rho",
+                        help="Used for dataloader key-validation/target read; prediction uses only x.")
+    parser.add_argument("--normalize_input", type=str2bool, default=True,
+                        help="Apply custom input normalization (vpec -> [-1,1]). Should match training.")
+    parser.add_argument("--normalize_target", type=str2bool, default=False,
+                        help="Apply custom target normalization. Set to match training if you trained in log-space.")
+    parser.add_argument("--eps", type=float, default=1e-12)
 
     args = parser.parse_args()
 
@@ -462,5 +416,11 @@ if __name__ == "__main__":
         sample_seed=args.sample_seed,
         input_case=args.input_case,
         keep_two_channels=args.keep_two_channels,
-        on_missing_input=args.on_missing_input,
+        validate_keys=args.validate_keys,
+        target_field=args.target_field,
+        exclude_list=args.exclude_list,
+        include_list=args.include_list,
+        normalize_input=args.normalize_input,
+        normalize_target=args.normalize_target,
+        eps=args.eps,
     )
