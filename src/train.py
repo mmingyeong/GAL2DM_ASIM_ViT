@@ -25,6 +25,7 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, ConstantLR, CosineAnnealingLR
 from tqdm import tqdm
 import pandas as pd
+import time
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 from src.data_loader import get_dataloader
@@ -187,6 +188,7 @@ def train(args):
     set_seed(args.seed, deterministic=args.deterministic)
     logger.info("🚀 Starting VoxelViTUNet3D training for 3D voxel-wise regression")
     logger.info(f"Args: {vars(args)}")
+    start_time = time.time()
 
     # ---- Resolve include/exclude lists per split ----
     train_include = _resolve_list_for_split("train", args.include_list, args.train_include_list, args.val_include_list)
@@ -282,9 +284,10 @@ def train(args):
         depth=args.depth,
         heads=args.heads,
         mlp_dim=args.mlp_dim,
-        encoder_channels=(32, 64, 128),
-        decoder_channels=(256, 128, 64),
-        dropout=0.1,
+        dim_head=args.vit_dim_head,
+        encoder_channels=tuple(args.vit_encoder_channels),
+        decoder_channels=tuple(args.vit_decoder_channels),
+        dropout=args.vit_dropout,
     ).to(args.device)
 
     logger.info(
@@ -292,6 +295,9 @@ def train(args):
         f"stride={patch_stride_3d}, dim={args.emb_dim}, depth={args.depth}, heads={args.heads}, "
         f"in_channels={in_ch}, input_case={args.input_case}, keep_two={args.keep_two_channels}"
     )
+    
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"🔢 Trainable params: {num_params/1e6:.2f}M")
 
     # ---- Optimizer / AMP ----
     use_amp = args.amp and str(args.device).startswith("cuda")
@@ -462,6 +468,16 @@ def train(args):
     logger.info(f"📦 Final model saved: {final_model_path}")
     logger.info(f"📝 Training log saved: {log_path}")
 
+    end_time = time.time()
+    elapsed = end_time - start_time
+
+    # 시/분/초 변환
+    hours = int(elapsed // 3600)
+    minutes = int((elapsed % 3600) // 60)
+    seconds = int(elapsed % 60)
+
+    logger.info(f"⏱️ Total training time: {hours:02d}:{minutes:02d}:{seconds:02d} (HH:MM:SS)")
+
     # ---- Optuna metrics JSON (minimal) ----
     metrics_payload = {
         "model": "VoxelViTUNet3D",
@@ -492,7 +508,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample_fraction", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument("--pin_memory", type=bool, default=True)
+    parser.add_argument("--pin_memory", type=str2bool, default=True)
 
     # ViT-specific geometry
     parser.add_argument("--image_size", type=int, default=128)
@@ -553,6 +569,11 @@ if __name__ == "__main__":
 
     # Optuna driver output
     parser.add_argument("--out_metrics", type=str, default=None)
+
+    parser.add_argument("--vit_encoder_channels", type=int, nargs="+", default=[32, 64, 128])
+    parser.add_argument("--vit_decoder_channels", type=int, nargs="+", default=[256, 128, 64])
+    parser.add_argument("--vit_dropout", type=float, default=0.1)
+    parser.add_argument("--vit_dim_head", type=int, default=64)
 
     args = parser.parse_args()
 

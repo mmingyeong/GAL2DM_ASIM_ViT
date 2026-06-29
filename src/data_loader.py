@@ -19,7 +19,7 @@ New Features:
     - normalization (custom mode):
         * input channel 0 (ngal): unchanged
         * input channel 1 (vpec): fixed-range scaling [-4000, 4000] → [-1, 1]
-        * target (typically rho): y' = (1/3) * log10(y + eps)
+        * target (typically rho): y' = (1/3) * log10(y)
 """
 
 from __future__ import annotations
@@ -53,6 +53,14 @@ def _load_yaml(yaml_path: str) -> dict:
         raise FileNotFoundError(f"YAML not found: {yaml_path}")
     with open(yaml_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _torch_dtype_to_numpy_dtype(dtype: torch.dtype) -> np.dtype:
+    if dtype == torch.float32:
+        return np.float32
+    if dtype == torch.float64:
+        return np.float64
+    raise ValueError(f"Unsupported torch dtype for dataset conversion: {dtype}")
 
 
 def _resolve_split_files(
@@ -162,36 +170,33 @@ def _apply_spatial_transform(
 # ----------------------------
 def _normalize_vpec_to_minus1_1(
     vpec: np.ndarray,
-    eps: float = 1e-12,
 ) -> np.ndarray:
     """
-    vpec 전용 정규화:
-    - 고정 범위 [-4000, 4000]를 [-1, 1]로 스케일링.
-      일반식: -1 + 2 * (x - vmin)/(vmax - vmin)
-      vmin=-4000, vmax=4000 이면 x / 4000 과 동일.
+    vpec normalization:
+    fixed range [-4000, 4000] -> [-1, 1]
     """
-    vmin = -4000.0
-    vmax = 4000.0
 
-    # 범위를 벗어난 값은 안전하게 클리핑
+    vmin = np.asarray(-4000.0, dtype=vpec.dtype)
+    vmax = np.asarray(4000.0, dtype=vpec.dtype)
+
+    # clipping
     vpec = np.clip(vpec, vmin, vmax)
 
-    half_range = 0.5 * (vmax - vmin)  # 4000
-    denom = half_range if half_range > eps else eps
-
-    return (vpec / denom).astype(vpec.dtype, copy=False)  # -> [-1, 1]
-
+    return (vpec / 4000.0).astype(vpec.dtype, copy=False)
 
 def _normalize_rho_log10(
     rho: np.ndarray,
-    eps: float = 1e-12,
 ) -> np.ndarray:
     """
-    rho 전용 정규화:
-        y' = (1/3) * log10(y + eps)
-    rho > 0 가정, eps로 0 방지.
+    rho normalization:
+        y' = (1/3) * log10(rho)
+
+    Assumes rho > 0.
     """
-    return ((1.0 / 3.0) * np.log10(rho + eps)).astype(rho.dtype, copy=False)
+
+    coef = np.asarray(1.0 / 3.0, dtype=rho.dtype)
+
+    return (coef * np.log10(rho)).astype(rho.dtype, copy=False)
 
 
 def _apply_normalization(
@@ -200,7 +205,6 @@ def _apply_normalization(
     mode: Literal["none", "custom"] = "none",
     normalize_input: bool = True,
     normalize_target: bool = False,
-    eps: float = 1e-12,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Normalization is per-sample by default (no dataset-wide stats).
@@ -214,7 +218,7 @@ def _apply_normalization(
                 - channel 2 이상   : 그대로 사용 (필요시 나중에 규칙 추가 가능)
             * target:
                 - normalize_target=True 일 때만
-                  y' = (1/3) * log10(y + eps)
+                  y' = (1/3) * log10(y)
     """
 
     if mode == "none":
@@ -236,7 +240,7 @@ def _apply_normalization(
         x_out[0] = x[0]
 
         # channel 1 : vpec -> [-1,1]
-        x_out[1] = _normalize_vpec_to_minus1_1(x[1], eps=eps)
+        x_out[1] = _normalize_vpec_to_minus1_1(x[1])
 
         # 나머지 채널이 있으면 그대로 복사
         if x.shape[0] > 2:
@@ -246,7 +250,7 @@ def _apply_normalization(
 
     # --- 타깃 정규화 ---
     if normalize_target:
-        y = _normalize_rho_log10(y, eps=eps)
+        y = _normalize_rho_log10(y)
 
     return np.ascontiguousarray(x), np.ascontiguousarray(y)
 
@@ -268,6 +272,7 @@ class ASIMHDF5Dataset(Dataset):
         self.file_paths = list(file_paths)
         self.target_field = target_field
         self.dtype = dtype
+        self.np_dtype = _torch_dtype_to_numpy_dtype(dtype)
         self.is_training = is_training
         self.seed = seed
 
@@ -280,7 +285,8 @@ class ASIMHDF5Dataset(Dataset):
             f"🔍 ASIMHDF5Dataset initialized: {len(self.file_paths)} samples, "
             f"target={target_field} | training={is_training} | "
             f"aug={'ON' if self.augmentation.get('enable', False) and is_training else 'OFF'} | "
-            f"norm={self.normalization.get('mode', 'none')}"
+            f"norm={self.normalization.get('mode', 'none')} | "
+            f"dtype={self.dtype}"
         )
 
     def __len__(self) -> int:
@@ -306,8 +312,15 @@ class ASIMHDF5Dataset(Dataset):
                 if "output_tscphi" not in f:
                     raise KeyError(f"'output_tscphi' not found in {fpath}")
                 y_np = _ensure_target_3d(f["output_tscphi"][:])
-                y_np = y_np * (0.72 ** -2)
-                y_np -= y_np.mean(dtype=np.float64)
+
+        # dtype 통일 (NumPy 단계부터 고정)
+        x_np = np.asarray(x_np, dtype=self.np_dtype)
+        y_np = np.asarray(y_np, dtype=self.np_dtype)
+
+        if self.target_field == "tscphi":
+            scale = np.asarray(0.72 ** -2, dtype=self.np_dtype)
+            y_np = y_np * scale
+            y_np -= y_np.mean(dtype=self.np_dtype)
 
         # (A) Augmentation (typically train only)
         if self.is_training and self.augmentation.get("enable", False):
@@ -330,11 +343,10 @@ class ASIMHDF5Dataset(Dataset):
                 mode=norm_mode,
                 normalize_input=bool(self.normalization.get("normalize_input", True)),
                 normalize_target=bool(self.normalization.get("normalize_target", False)),
-                eps=float(self.normalization.get("eps", 1e-12)),
             )
 
-        x = torch.from_numpy(np.ascontiguousarray(x_np)).to(self.dtype)
-        y = torch.from_numpy(np.ascontiguousarray(y_np)).to(self.dtype).unsqueeze(0)
+        x = torch.from_numpy(np.ascontiguousarray(x_np)).to(dtype=self.dtype)
+        y = torch.from_numpy(np.ascontiguousarray(y_np)).to(dtype=self.dtype).unsqueeze(0)
         return x, y
 
 
@@ -406,11 +418,10 @@ def get_dataloader(
                 "mode": "none" or "custom",
                 "normalize_input": True,
                 "normalize_target": False,
-                "eps": 1e-12,
             }
             # mode="custom" 일 때:
             #   - input: channel 0(ngal) 그대로, channel 1(vpec)은 [-4000,4000] -> [-1,1]
-            #   - target: normalize_target=True 이면 y' = (1/3)*log10(y + eps)
+            #   - target: normalize_target=True 이면 y' = (1/3)*log10(y)
         apply_augmentation_in:
             which split(s) to apply augmentation in (default: ("train",))
     """
@@ -421,14 +432,14 @@ def get_dataloader(
     # (0) Hardcoded auto-exclude list (known broken files)
     # ----------------------------
     AUTO_EXCLUDE = {
-        "/scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/test/1264.hdf5",
-        "/scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/test/1265.hdf5",
-        "/scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/test/1266.hdf5",
-        "/scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10248.hdf5",
-        "/scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10249.hdf5",
-        "/scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10250.hdf5",
-        "/scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10251.hdf5",
-        "/scratch/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10252.hdf5",
+        "/gpfs/adupuy/cosmicweb_asim/ASIM_TSC/samples/test/1264.hdf5",
+        "/gpfs/adupuy/cosmicweb_asim/ASIM_TSC/samples/test/1265.hdf5",
+        "/gpfs/adupuy/cosmicweb_asim/ASIM_TSC/samples/test/1266.hdf5",
+        "/gpfs/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10248.hdf5",
+        "/gpfs/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10249.hdf5",
+        "/gpfs/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10250.hdf5",
+        "/gpfs/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10251.hdf5",
+        "/gpfs/adupuy/cosmicweb_asim/ASIM_TSC/samples/training/10252.hdf5",
     }
 
     before_auto = len(files)
@@ -483,13 +494,17 @@ def get_dataloader(
         dataset = Subset(dataset, indices)
         logger.info(f"🔎 Sub-sampled {sample_size}/{total_len} ({sample_fraction*100:.1f}%)")
 
-    logger.info(f"📦 Split='{split}' | files={len(files)} | batch={batch_size} | target='{target_field}'")
+    logger.info(
+        f"📦 Split='{split}' | files={len(files)} | batch={batch_size} | "
+        f"target='{target_field}' | dtype={dtype}"
+    )
 
     # --- worker별 시드 고정 (재현성) ---
     def _worker_init_fn(worker_id: int):
         if seed is not None:
             base = int(seed) + worker_id
             np.random.seed(base)
+            torch.manual_seed(base)
 
     # --- split별 셔플 정책 및 성능 옵션 ---
     effective_shuffle = (split == "train") and shuffle
@@ -533,8 +548,9 @@ def sanity_check_sample(
             y = _ensure_target_3d(f["output_rho"][:])
         else:
             y = _ensure_target_3d(f["output_tscphi"][:])
-            y = y * (0.72 ** -2)
-            y = y - y.mean(dtype=np.float64)
+            y = np.asarray(y, dtype=x.dtype)
+            y = y * np.asarray(0.72 ** -2, dtype=y.dtype)
+            y = y - y.mean(dtype=y.dtype)
 
     logger.info(
         f"[SanityCheck] {split}[{idx}] = {os.path.basename(path)} | "
